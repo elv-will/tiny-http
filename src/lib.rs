@@ -185,6 +185,17 @@ pub struct SslConfig {
     pub private_key: Vec<u8>,
 }
 
+pub trait Acceptor: Send + Sync + 'static {
+    fn accept(&self, sock: TcpStream) -> Result<TcpStream, std::io::Error>;
+}
+
+pub struct EmptyAcceptor();
+impl Acceptor for EmptyAcceptor {
+    fn accept(&self, sock: TcpStream) -> Result<TcpStream, std::io::Error> {
+        Ok(sock)
+    }
+}
+
 impl Server {
     /// Shortcut for a simple server on a specific address.
     #[inline]
@@ -227,6 +238,14 @@ impl Server {
     pub fn from_listener(
         listener: net::TcpListener,
         ssl_config: Option<SslConfig>,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
+        Self::from_listener_with_acceptor::<EmptyAcceptor>(listener, ssl_config, EmptyAcceptor {})
+    }
+
+    pub fn from_listener_with_acceptor<A: Acceptor>(
+        listener: net::TcpListener,
+        ssl_config: Option<SslConfig>,
+        acceptor: A,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         // building the "close" variable
         let close_trigger = Arc::new(AtomicBool::new(false));
@@ -295,7 +314,10 @@ impl Server {
 
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
-                let new_client = match server.accept() {
+                let new_client: Result<ClientConnection, std::io::Error> = match server
+                    .accept()
+                    .and_then(|(sock, addr)| acceptor.accept(sock).map(|s| (s, addr)))
+                {
                     Ok((sock, _)) => {
                         use util::RefinedTcpStream;
                         let (read_closable, write_closable) = match ssl {
