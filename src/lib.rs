@@ -185,14 +185,20 @@ pub struct SslConfig {
     pub private_key: Vec<u8>,
 }
 
+pub enum AcceptorResult {
+    Abort,
+    Fatal(std::io::Error),
+    Ok(TcpStream),
+}
+
 pub trait Acceptor: Send + Sync + 'static {
-    fn accept(&self, sock: TcpStream) -> Result<TcpStream, std::io::Error>;
+    fn accept(&self, sock: TcpStream) -> AcceptorResult;
 }
 
 pub struct EmptyAcceptor();
 impl Acceptor for EmptyAcceptor {
-    fn accept(&self, sock: TcpStream) -> Result<TcpStream, std::io::Error> {
-        Ok(sock)
+    fn accept(&self, sock: TcpStream) -> AcceptorResult {
+        AcceptorResult::Ok(sock)
     }
 }
 
@@ -314,31 +320,35 @@ impl Server {
 
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
-                let new_client: Result<ClientConnection, std::io::Error> = match server
-                    .accept()
-                    .and_then(|(sock, addr)| acceptor.accept(sock).map(|s| (s, addr)))
-                {
+                let new_client: Result<ClientConnection, std::io::Error> = match server.accept() {
                     Ok((sock, _)) => {
-                        use util::RefinedTcpStream;
-                        let (read_closable, write_closable) = match ssl {
-                            None => RefinedTcpStream::new(sock),
-                            #[cfg(feature = "ssl")]
-                            Some(ref ssl) => {
-                                let ssl = openssl::ssl::Ssl::new(ssl).expect("Couldn't create ssl");
-                                // trying to apply SSL over the connection
-                                // if an error occurs, we just close the socket and resume listening
-                                let sock = match ssl.accept(sock) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
+                        match acceptor.accept(sock) {
+                            AcceptorResult::Abort => continue,
+                            AcceptorResult::Fatal(e) => Err(e),
+                            AcceptorResult::Ok(sock) => {
+                                use util::RefinedTcpStream;
+                                let (read_closable, write_closable) = match ssl {
+                                    None => RefinedTcpStream::new(sock),
+                                    #[cfg(feature = "ssl")]
+                                    Some(ref ssl) => {
+                                        let ssl = openssl::ssl::Ssl::new(ssl)
+                                            .expect("Couldn't create ssl");
+                                        // trying to apply SSL over the connection
+                                        // if an error occurs, we just close the socket and resume listening
+                                        let sock = match ssl.accept(sock) {
+                                            Ok(s) => s,
+                                            Err(_) => continue,
+                                        };
+
+                                        RefinedTcpStream::new(sock)
+                                    }
+                                    #[cfg(not(feature = "ssl"))]
+                                    Some(_) => unreachable!(),
                                 };
 
-                                RefinedTcpStream::new(sock)
+                                Ok(ClientConnection::new(write_closable, read_closable))
                             }
-                            #[cfg(not(feature = "ssl"))]
-                            Some(_) => unreachable!(),
-                        };
-
-                        Ok(ClientConnection::new(write_closable, read_closable))
+                        }
                     }
                     Err(e) => Err(e),
                 };
