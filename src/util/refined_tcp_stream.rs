@@ -2,9 +2,11 @@ use std::io::Result as IoResult;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 
+#[cfg(feature = "mbtls")]
+use mbedtls::ssl::{Config, Context};
 #[cfg(feature = "ssl")]
 use openssl::ssl::SslStream;
-#[cfg(feature = "ssl")]
+#[cfg(any(feature = "mbtls", feature = "ssl"))]
 use std::sync::{Arc, Mutex};
 
 pub struct RefinedTcpStream {
@@ -13,10 +15,28 @@ pub struct RefinedTcpStream {
     close_write: bool,
 }
 
+#[cfg(feature = "mbtls")]
+pub struct MbedTlsStream {
+    pub ctx: Context,
+    pub peer_addr: SocketAddr,
+}
+
+#[cfg(feature = "mbtls")]
+impl MbedTlsStream {
+    pub fn new(config: Arc<Config>, peer_addr: SocketAddr) -> MbedTlsStream {
+        MbedTlsStream {
+            ctx: mbedtls::ssl::Context::new(config),
+            peer_addr,
+        }
+    }
+}
+
 pub enum Stream {
     Http(TcpStream),
     #[cfg(feature = "ssl")]
     Https(Arc<Mutex<SslStream<TcpStream>>>),
+    #[cfg(feature = "mbtls")]
+    MbedTls(Arc<Mutex<MbedTlsStream>>),
 }
 
 impl From<TcpStream> for Stream {
@@ -34,6 +54,13 @@ impl From<SslStream<TcpStream>> for Stream {
     }
 }
 
+#[cfg(feature = "mbedtls")]
+impl From<MbedTlsStream> for Stream {
+    fn from(ctx: MbedTlsStream) -> Self {
+        Stream::MbedTls(Arc::new(Mutex::new(ctx)))
+    }
+}
+
 impl RefinedTcpStream {
     pub fn new<S>(stream: S) -> (RefinedTcpStream, RefinedTcpStream)
     where
@@ -45,6 +72,8 @@ impl RefinedTcpStream {
             Stream::Http(ref stream) => Stream::Http(stream.try_clone().unwrap()),
             #[cfg(feature = "ssl")]
             Stream::Https(ref stream) => Stream::Https(stream.clone()),
+            #[cfg(feature = "mbtls")]
+            Stream::MbedTls(ref stream) => Stream::MbedTls(stream.clone()),
         };
 
         let read = RefinedTcpStream {
@@ -69,6 +98,8 @@ impl RefinedTcpStream {
             Stream::Http(_) => false,
             #[cfg(feature = "ssl")]
             Stream::Https(_) => true,
+            #[cfg(feature = "mbtls")]
+            Stream::MbedTls(_) => true,
         }
     }
 
@@ -77,6 +108,8 @@ impl RefinedTcpStream {
             Stream::Http(ref mut stream) => stream.peer_addr(),
             #[cfg(feature = "ssl")]
             Stream::Https(ref mut stream) => stream.lock().unwrap().get_ref().peer_addr(),
+            #[cfg(feature = "mbtls")]
+            Stream::MbedTls(ref mut stream) => Ok(stream.lock().unwrap().peer_addr),
         }
     }
 }
@@ -94,6 +127,8 @@ impl Drop for RefinedTcpStream {
                     .get_mut()
                     .shutdown(Shutdown::Read)
                     .ok(),
+                #[cfg(feature = "mbtls")]
+                Stream::MbedTls(_) => Some(()), // Should handle in the context object
             };
         }
 
@@ -108,6 +143,8 @@ impl Drop for RefinedTcpStream {
                     .get_mut()
                     .shutdown(Shutdown::Write)
                     .ok(),
+                #[cfg(feature = "mbtls")]
+                Stream::MbedTls(_) => Some(()),
             };
         }
     }
@@ -119,6 +156,8 @@ impl Read for RefinedTcpStream {
             Stream::Http(ref mut stream) => stream.read(buf),
             #[cfg(feature = "ssl")]
             Stream::Https(ref mut stream) => stream.lock().unwrap().read(buf),
+            #[cfg(feature = "mbtls")]
+            Stream::MbedTls(ref mut stream) => stream.lock().unwrap().ctx.read(buf),
         }
     }
 }
@@ -129,6 +168,8 @@ impl Write for RefinedTcpStream {
             Stream::Http(ref mut stream) => stream.write(buf),
             #[cfg(feature = "ssl")]
             Stream::Https(ref mut stream) => stream.lock().unwrap().write(buf),
+            #[cfg(feature = "mbtls")]
+            Stream::MbedTls(ref mut stream) => stream.lock().unwrap().ctx.write(buf),
         }
     }
 
@@ -137,6 +178,8 @@ impl Write for RefinedTcpStream {
             Stream::Http(ref mut stream) => stream.flush(),
             #[cfg(feature = "ssl")]
             Stream::Https(ref mut stream) => stream.lock().unwrap().flush(),
+            #[cfg(feature = "mbtls")]
+            Stream::MbedTls(ref mut stream) => stream.lock().unwrap().ctx.flush(),
         }
     }
 }

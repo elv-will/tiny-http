@@ -185,23 +185,6 @@ pub struct SslConfig {
     pub private_key: Vec<u8>,
 }
 
-pub enum AcceptorResult {
-    Abort,
-    Fatal(std::io::Error),
-    Ok(TcpStream),
-}
-
-pub trait Acceptor: Send + Sync + 'static {
-    fn accept(&self, sock: TcpStream) -> AcceptorResult;
-}
-
-pub struct EmptyAcceptor();
-impl Acceptor for EmptyAcceptor {
-    fn accept(&self, sock: TcpStream) -> AcceptorResult {
-        AcceptorResult::Ok(sock)
-    }
-}
-
 impl Server {
     /// Shortcut for a simple server on a specific address.
     #[inline]
@@ -213,7 +196,7 @@ impl Server {
     }
 
     /// Shortcut for an HTTPS server on a specific address.
-    #[cfg(feature = "ssl")]
+    #[cfg(any(feature = "ssl", feature="mbtls"))]
     #[inline]
     pub fn https<A>(
         addr: A,
@@ -245,14 +228,6 @@ impl Server {
         listener: net::TcpListener,
         ssl_config: Option<SslConfig>,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
-        Self::from_listener_with_acceptor::<EmptyAcceptor>(listener, ssl_config, EmptyAcceptor {})
-    }
-
-    pub fn from_listener_with_acceptor<A: Acceptor>(
-        listener: net::TcpListener,
-        ssl_config: Option<SslConfig>,
-        acceptor: A,
-    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         // building the "close" variable
         let close_trigger = Arc::new(AtomicBool::new(false));
 
@@ -264,46 +239,64 @@ impl Server {
         };
 
         // building the SSL capabilities
-        #[cfg(feature = "ssl")]
-        type SslContext = openssl::ssl::SslContext;
-        #[cfg(not(feature = "ssl"))]
-        type SslContext = ();
-        let ssl: Option<SslContext> = match ssl_config {
-            #[cfg(feature = "ssl")]
-            Some(mut config) => {
-                use openssl::pkey::PKey;
-                use openssl::ssl;
-                use openssl::ssl::SslVerifyMode;
-                use openssl::x509::X509;
-
-                let mut ctxt = SslContext::builder(ssl::SslMethod::tls())?;
-                ctxt.set_cipher_list("DEFAULT")?;
-                let certificate = X509::from_pem(&config.certificate[..])?;
-                ctxt.set_certificate(&certificate)?;
-                let private_key = PKey::private_key_from_pem(&config.private_key[..])?;
-                ctxt.set_private_key(&private_key)?;
-                ctxt.set_verify(SslVerifyMode::NONE);
-                ctxt.check_private_key()?;
-
-                // let's wipe the certificate and private key from memory, because we're
-                // better safe than sorry
-                for b in &mut config.certificate {
-                    *b = 0;
-                }
-                for b in &mut config.private_key {
-                    *b = 0;
-                }
-
-                Some(ctxt.build())
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "ssl")] {
+            type SslContext = openssl::ssl::SslContext;
+            } else if #[cfg(feature = "mbtls")] {
+            type SslContext = Arc<mbedtls::ssl::Config>;
+            } else {
+            type SslContext = ();
             }
-            #[cfg(not(feature = "ssl"))]
-            Some(_) => {
-                return Err(
-                    "Building a server with SSL requires enabling the `ssl` feature \
-                                   in tiny-http"
-                        .to_owned()
-                        .into(),
-                )
+        }
+        let ssl: Option<SslContext> = match ssl_config {
+            #[allow(unused_mut)]
+            Some(mut config) => {
+                cfg_if::cfg_if! {
+                    if #[cfg(feature = "ssl")] {
+                        use openssl::pkey::PKey;
+                        use openssl::ssl;
+                        use openssl::ssl::SslVerifyMode;
+                        use openssl::x509::X509;
+
+                        let mut ctxt = SslContext::builder(ssl::SslMethod::tls())?;
+                        ctxt.set_cipher_list("DEFAULT")?;
+                        let certificate = X509::from_pem(&config.certificate[..])?;
+                        ctxt.set_certificate(&certificate)?;
+                        let private_key = PKey::private_key_from_pem(&config.private_key[..])?;
+                        ctxt.set_private_key(&private_key)?;
+                        ctxt.set_verify(SslVerifyMode::NONE);
+                        ctxt.check_private_key()?;
+
+                        // let's wipe the certificate and private key from memory, because we're
+                        // better safe than sorry
+                        for b in &mut config.certificate {
+                            *b = 0;
+                        }
+                        for b in &mut config.private_key {
+                            *b = 0;
+                        }
+
+                        Some(ctxt.build())
+                    } else if #[cfg(feature = "mbtls")] {
+                        use mbedtls::ssl::config::{Endpoint, Preset, Transport};
+                        let entropy = entropy_new();
+                        let rng = Arc::new(mbedtls::rng::CtrDrbg::new(Arc::new(entropy), None)?);
+                        let cert = Arc::new(mbedtls::x509::Certificate::from_pem_multiple(&config.certificate[..])?);
+                        let key = Arc::new(mbedtls::pk::Pk::from_private_key(&config.private_key[..], None)?);
+                        let mut config = mbedtls::ssl::Config::new(Endpoint::Server, Transport::Stream, Preset::Default);
+                        config.set_rng(rng);
+                        config.push_cert(cert, key)?;
+
+                        Some(Arc::new(config))
+                    } else {
+                        return Err(
+                            "Building a server with SSL requires enabling the `ssl` or `mbtls` feature \
+                                           in tiny-http"
+                                .to_owned()
+                                .into(),
+                        )
+                    }
+                }
             }
             None => None,
         };
@@ -322,33 +315,37 @@ impl Server {
             while !inside_close_trigger.load(Relaxed) {
                 let new_client: Result<ClientConnection, std::io::Error> = match server.accept() {
                     Ok((sock, _)) => {
-                        match acceptor.accept(sock) {
-                            AcceptorResult::Abort => continue,
-                            AcceptorResult::Fatal(e) => Err(e),
-                            AcceptorResult::Ok(sock) => {
-                                use util::RefinedTcpStream;
-                                let (read_closable, write_closable) = match ssl {
-                                    None => RefinedTcpStream::new(sock),
-                                    #[cfg(feature = "ssl")]
-                                    Some(ref ssl) => {
-                                        let ssl = openssl::ssl::Ssl::new(ssl)
-                                            .expect("Couldn't create ssl");
-                                        // trying to apply SSL over the connection
-                                        // if an error occurs, we just close the socket and resume listening
-                                        let sock = match ssl.accept(sock) {
-                                            Ok(s) => s,
-                                            Err(_) => continue,
-                                        };
+                            use util::RefinedTcpStream;
+                            let (read_closable, write_closable) = match ssl {
+                                None => RefinedTcpStream::new(sock),
+                                Some(ref ssl) => {
+                                    cfg_if::cfg_if!{
+                                        if #[cfg(feature = "ssl")] {
+                                            let ssl = openssl::ssl::Ssl::new(ssl)
+                                                .expect("Couldn't create ssl");
+                                            // trying to apply SSL over the connection
+                                            // if an error occurs, we just close the socket and resume listening
+                                            let sock = match ssl.accept(sock) {
+                                                Ok(s) => s,
+                                                Err(_) => continue,
+                                            };
+                                            RefinedTcpStream::new(sock)
 
-                                        RefinedTcpStream::new(sock)
+                                        } else if #[cfg(feature = "mbtls")] {
+                                            let mut ssl = crate::util::MbedTlsStream::new(ssl.clone(), sock.peer_addr().unwrap());
+                                            if let Err(e) = ssl.ctx.establish(sock, None) {
+                                                eprintln!("got mbedtls error: {}", e);
+                                            }
+                                            RefinedTcpStream::new(ssl)
+                                        } else {
+                                            unreachable!()
+                                        }
                                     }
-                                    #[cfg(not(feature = "ssl"))]
-                                    Some(_) => unreachable!(),
-                                };
 
-                                Ok(ClientConnection::new(write_closable, read_closable))
-                            }
-                        }
+                                }
+                            };
+
+                            Ok(ClientConnection::new(write_closable, read_closable))
                     }
                     Err(e) => Err(e),
                 };
@@ -464,4 +461,17 @@ impl Drop for Server {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
+}
+
+#[cfg(feature = "mbtls")]
+cfg_if::cfg_if! {
+    if #[cfg(target_env = "sgx")] {
+        pub fn entropy_new() -> mbedtls::rng::Rdseed {
+            mbedtls::rng::Rdseed
+        }
+    } else {
+        pub fn entropy_new() -> mbedtls::rng::OsEntropy {
+            mbedtls::rng::OsEntropy::new()
+        }
+    } 
 }

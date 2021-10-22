@@ -13,14 +13,17 @@ edition = "2018"
 [features]
 default = []
 ssl = ["openssl"]
+mbtls = ["mbedtls"]
 
 [dependencies]
 ascii = "1.0"
 chunked_transfer = "1"
 openssl = { version = "0.10", optional = true }
+mbedtls = { version = "0.8.1", optional = true }
 url = "2"
 chrono = { version = "0.4", default-features = false, features=["clock"] }
 log = "0.4"
+cfg-if = "1.0.0"
 
 [dev-dependencies]
 rustc-serialize = "0.3"
